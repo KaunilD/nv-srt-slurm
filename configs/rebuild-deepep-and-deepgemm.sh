@@ -31,8 +31,11 @@ git submodule update --init --recursive
 
 python3 -m pip uninstall -y sgl-deep-gemm deep-gemm deep_gemm || true
 
-bash build_sgl_deep_gemm.sh
-python3 -m pip install --force-reinstall --no-deps dist/sgl_deep_gemm-*.whl
+# DeepGEMM ships build.sh/install.sh (not build_sgl_deep_gemm.sh). Force a local
+# source build so we don't depend on prebuilt wheels or a clean git tree.
+export DG_FORCE_BUILD=1
+export DG_USE_LOCAL_VERSION=0
+bash install.sh
 
 python3 - <<'PY'
 import deep_gemm
