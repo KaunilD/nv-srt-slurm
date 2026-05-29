@@ -12,12 +12,13 @@ if [ -f /configs/rebuild-deepep.sh ]; then
 fi
 
 # Skip the rebuild if the container already has the required DeepGEMM API.
-if python3 - <<'PY'
+# Import from / so a leftover /tmp/DeepGEMM checkout doesn't shadow site-packages.
+if (cd / && python3 - <<'PY'
 import deep_gemm
 assert hasattr(deep_gemm, "m_grouped_bf16_gemm_nt_masked")
 print("Existing deep_gemm is OK:", deep_gemm.__file__)
 PY
-then
+); then
   exit 0
 fi
 
@@ -36,6 +37,11 @@ python3 -m pip uninstall -y sgl-deep-gemm deep-gemm deep_gemm || true
 export DG_FORCE_BUILD=1
 export DG_USE_LOCAL_VERSION=0
 bash install.sh
+
+# Leave the source tree before importing: cwd=/tmp/DeepGEMM puts ./deep_gemm on
+# sys.path without the compiled _C extension, causing ImportError.
+cd /
+rm -rf /tmp/DeepGEMM
 
 python3 - <<'PY'
 import deep_gemm
