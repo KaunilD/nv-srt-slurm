@@ -3,6 +3,7 @@
 
 """Tests for dry-run config details display (mounts, env vars)."""
 
+import os
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -66,6 +67,16 @@ class TestDryRunMounts:
         assert "/shared/cache" in output
         assert "/cache" in output
         assert "recipe" in output
+
+    def test_extra_mount_expands_env_and_user_in_dry_run(self, capsys):
+        with patch.dict(os.environ, {"SRT_EXTRA_ROOT": "/expanded/extra", "HOME": "/home/tester"}):
+            config = _make_config({"extra_mount": ["$SRT_EXTRA_ROOT:/extra", "~/cache:/cache"]})
+            show_config_details(config)
+        output = capsys.readouterr().out
+        assert "/expanded/extra" in output
+        assert "/home/tester/cache" in output
+        assert "$SRT_EXTRA_ROOT" not in output
+        assert "~/cache" not in output
 
     def test_cluster_mounts_from_srtslurm_yaml(self, capsys):
         cluster_mounts = {"/shared/datasets": "/datasets", "/shared/models": "/models"}
@@ -207,8 +218,8 @@ class TestDryRunSrunOptions:
         config = _make_config({"srun_options": {"export": "ALL", "cpu-bind": "none"}})
         show_config_details(config)
         output = capsys.readouterr().out
-        assert "--export ALL" in output
-        assert "--cpu-bind none" in output
+        assert "--export=ALL" in output
+        assert "--cpu-bind=none" in output
 
     def test_no_srun_options_no_output(self, capsys):
         config = _make_config()
@@ -302,3 +313,54 @@ class TestDryRunExecutionExtensions:
         output = capsys.readouterr().out
         assert "<job container>" in output
         assert "MOONCAKE_PROTOCOL" in output
+
+
+class TestDryRunHetJobs:
+    """Het structure panel appears only when het is enabled."""
+
+    def test_het_panel_rendered_when_enabled(self, capsys):
+        config = _make_config(
+            {
+                "resources": {
+                    "gpu_type": "gb200",
+                    "gpus_per_node": 4,
+                    "prefill_nodes": 12,
+                    "decode_nodes": 10,
+                    "prefill_workers": 12,
+                    "decode_workers": 10,
+                    "het_jobs": True,
+                },
+            }
+        )
+        show_config_details(config)
+        output = capsys.readouterr().out
+        assert "Heterogeneous Job" in output
+        assert "prefill" in output
+        assert "decode" in output
+
+    def test_het_panel_hidden_when_disabled(self, capsys):
+        """No het panel when het_jobs is unset (recipe default)."""
+        config = _make_config()
+        show_config_details(config)
+        output = capsys.readouterr().out
+        assert "Heterogeneous Job" not in output
+
+    def test_het_panel_shows_infra_folded_into_prefill(self, capsys):
+        config = _make_config(
+            {
+                "resources": {
+                    "gpu_type": "gb200",
+                    "gpus_per_node": 4,
+                    "prefill_nodes": 12,
+                    "decode_nodes": 10,
+                    "prefill_workers": 12,
+                    "decode_workers": 10,
+                    "het_jobs": True,
+                },
+                "infra": {"etcd_nats_dedicated_node": True},
+            }
+        )
+        show_config_details(config)
+        output = capsys.readouterr().out
+        assert "Heterogeneous Job" in output
+        assert "first node" in output  # infra note on the prefill row

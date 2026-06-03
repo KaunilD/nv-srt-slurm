@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from srtctl.backends.sglang import MOONCAKE_HTTP_METADATA_PORT, MOONCAKE_MASTER_PORT, SGLangProtocol
+from srtctl.backends.sglang import SGLangProtocol
 from srtctl.cli.mixins import (
     BenchmarkStageMixin,
     FrontendStageMixin,
@@ -44,8 +44,15 @@ from srtctl.core.runtime import RuntimeContext
 from srtctl.core.schema import SrtConfig
 from srtctl.core.slurm import get_slurm_job_id, start_srun_process
 from srtctl.core.status import JobStage, JobStatus, StatusReporter
-from srtctl.core.topology import Endpoint, Process
+from srtctl.core.topology import Endpoint, NodePortAllocator, Process, allocate_endpoints_het
 from srtctl.logging_utils import setup_logging
+from srtctl.ports import (
+    ETCD_CLIENT_PORT,
+    FRONTEND_PUBLIC_PORT,
+    MOONCAKE_HTTP_METADATA_PORT,
+    MOONCAKE_MASTER_PORT,
+    NATS_PORT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +86,22 @@ class SweepOrchestrator(
     def endpoints(self) -> list[Endpoint]:
         """Compute endpoint allocation topology (cached).
 
-        This is the single source of truth for endpoint assignments.
+        This is the single source of truth for endpoint assignments. Under
+        SLURM heterogeneous jobs, prefill and decode workers are allocated
+        from their own component nodelists so neither side bleeds into the
+        other's topology segment.
         """
         r = self.config.resources
+        if self.runtime.nodes.het:
+            return allocate_endpoints_het(
+                num_prefill=r.num_prefill,
+                gpus_per_prefill=r.gpus_per_prefill,
+                prefill_nodes=self.runtime.nodes.prefill_group,
+                num_decode=r.num_decode,
+                gpus_per_decode=r.gpus_per_decode,
+                decode_nodes=self.runtime.nodes.decode_group,
+                gpus_per_node=r.gpus_per_node,
+            )
         return self.backend.allocate_endpoints(
             num_prefill=r.num_prefill,
             num_decode=r.num_decode,
@@ -91,12 +111,18 @@ class SweepOrchestrator(
             gpus_per_agg=r.gpus_per_agg,
             gpus_per_node=r.gpus_per_node,
             available_nodes=self.runtime.nodes.worker,
+            spread_workers=r.spread_workers,
         )
 
     @functools.cached_property
     def backend_processes(self) -> list[Process]:
-        """Compute physical process topology from endpoints (cached)."""
-        return self.backend.endpoints_to_processes(self.endpoints)
+        """Compute physical process topology from endpoints (cached).
+
+        Port defaults come from ``srtctl.ports`` and are allocated
+        deterministically within a job.
+        """
+        allocator = NodePortAllocator()
+        return self.backend.endpoints_to_processes(self.endpoints, port_allocator=allocator)
 
     def start_head_infrastructure(self, registry: ProcessRegistry) -> ManagedProcess:
         """Start NATS and etcd on the infra node.
@@ -138,6 +164,7 @@ class SweepOrchestrator(
             output=str(infra_log),
             container_image=str(self.runtime.container_image),
             container_mounts=mounts,
+            het_group=self.runtime.nodes.het_group_for(infra_node),
         )
 
         managed = ManagedProcess(
@@ -149,13 +176,13 @@ class SweepOrchestrator(
         )
 
         # 300s timeout to handle slow container imports on first run
-        logger.info("Waiting for NATS (port 4222) on %s...", infra_node)
-        if not wait_for_port(infra_node, 4222, timeout=300):
+        logger.info("Waiting for NATS (port %d) on %s...", NATS_PORT, infra_node)
+        if not wait_for_port(infra_node, NATS_PORT, timeout=300):
             raise RuntimeError("NATS failed to start")
         logger.info("NATS is ready")
 
-        logger.info("Waiting for etcd (port 2379) on %s...", infra_node)
-        if not wait_for_port(infra_node, 2379, timeout=300):
+        logger.info("Waiting for etcd (port %d) on %s...", ETCD_CLIENT_PORT, infra_node)
+        if not wait_for_port(infra_node, ETCD_CLIENT_PORT, timeout=300):
             raise RuntimeError("etcd failed to start")
         logger.info("etcd is ready")
 
@@ -170,7 +197,7 @@ class SweepOrchestrator(
         We always start the master with its embedded HTTP metadata server enabled
         (`--enable_http_metadata_server=true`) so:
 
-        1. Workers can use ``MOONCAKE_TE_META_DATA_SERVER=http://infra:8080/metadata``
+        1. Workers can use ``MOONCAKE_TE_META_DATA_SERVER=http://infra:<metadata-port>/metadata``
            without a separate metadata service.
         2. Dynamo's KV router shared-cache path
            (`lib/llm/src/kv_router/shared_cache.rs`) can call the master's
@@ -206,6 +233,7 @@ class SweepOrchestrator(
             output=str(mooncake_log),
             container_image=container,
             container_mounts=self.runtime.container_mounts,
+            het_group=self.runtime.nodes.het_group_for(infra_node),
         )
 
         managed = ManagedProcess(
@@ -241,7 +269,7 @@ class SweepOrchestrator(
         logger.info("=" * 60)
         logger.info("Connection Commands")
         logger.info("=" * 60)
-        logger.info("Frontend URL: http://%s:8000", self.runtime.nodes.head)
+        logger.info("Frontend URL: http://%s:%d", self.runtime.nodes.head, FRONTEND_PUBLIC_PORT)
         logger.info("")
         logger.info("To connect to head node (%s):", self.runtime.nodes.head)
         logger.info(
@@ -407,6 +435,7 @@ class SweepOrchestrator(
                 container_mounts=self.runtime.container_mounts,
                 env_to_set=hf_env,
                 use_bash_wrapper=False,  # command is already bash -c
+                het_group=self.runtime.nodes.het_group_for(download_node),
             )
 
             timeout_sec = 60 * 60  # 1 hour; large models can take a while
@@ -449,7 +478,7 @@ class SweepOrchestrator(
             logger.info("EVAL_ONLY: Waiting for server health before eval...")
             if not wait_for_model(
                 host=self.runtime.nodes.head,
-                port=8000,
+                port=FRONTEND_PUBLIC_PORT,
                 n_prefill=n_prefill,
                 n_decode=n_decode,
                 poll_interval=float(hc.interval_seconds),
@@ -461,7 +490,7 @@ class SweepOrchestrator(
                 logger.error("Server did not become healthy for eval")
                 return 1
         else:
-            if not wait_for_port(self.runtime.nodes.head, 8000, timeout=30):
+            if not wait_for_port(self.runtime.nodes.head, FRONTEND_PUBLIC_PORT, timeout=30):
                 logger.error("Server health check failed before eval - skipping")
                 return 1
 
@@ -534,6 +563,7 @@ class SweepOrchestrator(
             container_image=str(self.runtime.container_image),
             container_mounts=self.runtime.container_mounts,
             env_to_set=env_to_set,
+            het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
         )
 
         while proc.poll() is None:
