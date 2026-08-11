@@ -24,7 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -345,6 +345,8 @@ def show_config_details(config: SrtConfig) -> None:
         if mooncake_cfg is not None:
             details.add_row("mooncake", "container", mooncake_cfg.container or "<job container>")
             details.add_row("mooncake", "master_port", f"{MOONCAKE_MASTER_PORT} (auto)")
+            if mooncake_cfg.master_extra_args:
+                details.add_row("mooncake", "master_extra_args", shlex.join(mooncake_cfg.master_extra_args))
             if hasattr(backend, "build_mooncake_store_config"):
                 # vLLM workers need MOONCAKE_CONFIG_PATH pointing at a JSON file
                 # — srtslurm writes this at job start. Show the resolved JSON
@@ -452,7 +454,7 @@ def generate_minimal_sbatch_script(
         # Sum is informational only — the template iterates het_components and
         # ignores total_nodes when het_components is set.
         total_nodes = sum(c.nodes for c in het_components)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     # Resolve container image path (expand aliases from srtslurm.yaml)
     container_image = os.path.expandvars(config.model.container)
@@ -633,7 +635,7 @@ def submit_with_orchestrator(
     os.chmod(script_path, 0o755)
 
     console.print(f"[bold cyan]🚀 Submitting:[/] {config.name}")
-    logging.debug(f"Script: {script_path}")
+    logger.debug("Script: %s", script_path)
 
     keep_script = False
     try:
@@ -678,7 +680,7 @@ def submit_with_orchestrator(
             "orchestrator": True,
             "job_id": job_id,
             "job_name": job_name,
-            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "generated_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             # Model info
             "model": {
                 "path": config.model.path,
@@ -837,7 +839,7 @@ def is_sweep_config(config_path: Path) -> bool:
         with open(config_path) as f:
             config = yaml.safe_load(f)
         return "sweep" in config if config else False
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -891,7 +893,11 @@ def submit_sweep(
             )
         )
 
-        sweep_dir = Path.cwd() / "dry-runs" / f"{sweep_config['name']}_sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        sweep_dir = (
+            Path.cwd()
+            / "dry-runs"
+            / f"{sweep_config['name']}_sweep_{datetime.now(tz=timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+        )
         sweep_dir.mkdir(parents=True, exist_ok=True)
 
         with open(sweep_dir / "sweep_config.yaml", "w") as f:
@@ -1046,7 +1052,7 @@ def submit_directory(
             success_count += 1
         except Exception as e:
             console.print(f"[bold red]  ❌ Error:[/] {e}")
-            logging.debug("Full traceback:", exc_info=True)
+            logger.debug("Full traceback:", exc_info=True)
             error_count += 1
 
         console.print()
@@ -1606,10 +1612,10 @@ def main():
         if json_mode:
             sys.stdout.write(json.dumps({"status": "error", "error": str(e)}) + "\n")
             sys.stdout.flush()
-            logging.debug("Full traceback:", exc_info=True)
+            logger.debug("Full traceback:", exc_info=True)
             sys.exit(1)
         console.print(f"[bold red]Error:[/] {e}")
-        logging.debug("Full traceback:", exc_info=True)
+        logger.debug("Full traceback:", exc_info=True)
         sys.exit(1)
 
     # Mock-mode post-submit: spawn the detached orchestrator worker so the

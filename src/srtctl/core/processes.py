@@ -22,6 +22,25 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def terminate_and_reap(popen: subprocess.Popen, *, terminate_timeout: float = 10.0, kill_timeout: float = 5.0) -> bool:
+    """Terminate, then kill, then report whether the child was reaped."""
+    if popen.poll() is not None:
+        return True
+    popen.terminate()
+    try:
+        popen.wait(timeout=terminate_timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        logger.warning("Process did not terminate, killing...")
+    popen.kill()
+    try:
+        popen.wait(timeout=kill_timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        logger.error("Process was not reaped after SIGKILL")
+        return False
+
+
 @dataclass
 class ManagedProcess:
     """A process managed by the registry.
@@ -55,13 +74,8 @@ class ManagedProcess:
         if not self.is_running:
             return
 
-        self.popen.terminate()
-        try:
-            self.popen.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            logger.warning("Process %s did not terminate, killing...", self.name)
-            self.popen.kill()
-            self.popen.wait(timeout=5)
+        if not terminate_and_reap(self.popen, terminate_timeout=timeout, kill_timeout=5):
+            logger.error("Process %s was not reaped after SIGKILL", self.name)
 
 
 # Type alias for named process collections
@@ -155,7 +169,7 @@ class ProcessRegistry:
                     logger.debug("Terminating process: %s", name)
                     try:
                         proc.terminate()
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001
                         logger.warning("Failed to terminate %s: %s", name, e)
 
     def print_failure_details(self, tail_lines: int = 50) -> None:
@@ -190,7 +204,7 @@ class ProcessRegistry:
                             logger.error("\nLast %d lines of log:", tail_lines)
                             for line in lines[-tail_lines:]:
                                 logger.error("  %s", line)
-                    except Exception as e:
+                    except Exception as e:  # noqa: BLE001
                         logger.error("Could not read log file: %s", e)
 
         logger.error("=" * 60)

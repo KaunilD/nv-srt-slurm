@@ -164,6 +164,8 @@ class WorkerStageMixin:
             "DYN_REQUEST_PLANE": self.config.dynamo.request_plane,
             "DYN_SKIP_SGLANG_LOG_FORMATTING": "1",
         }
+        if self.config.dynamo.event_plane:
+            env_to_set["DYN_EVENT_PLANE"] = self.config.dynamo.event_plane
 
         # Add OTEL env vars (before mode-specific env so OTEL_SERVICE_NAME can be overridden)
         env_to_set.update(build_otel_env(self.config.observability, mode))
@@ -226,6 +228,13 @@ class WorkerStageMixin:
         fp_cmd = f"( {fp_cmd} )"
         bash_preamble = f"{bash_preamble} && {fp_cmd}" if bash_preamble else fp_cmd
 
+        # vLLM uses VLLM_PORT as the initial port for its internal message
+        # queues. In a multi-node endpoint, concurrent TP ranks inherit the
+        # same value and can race while probing and binding remote TCP queues.
+        # Let vLLM choose an ephemeral base port instead.
+        endpoint_nodes = {endpoint_process.node for endpoint_process in endpoint_processes}
+        env_to_unset = ["VLLM_PORT"] if self.backend.type == "vllm" and len(endpoint_nodes) > 1 else None
+
         proc = start_srun_process(
             command=cmd,
             nodelist=[process.node],
@@ -233,6 +242,7 @@ class WorkerStageMixin:
             container_image=str(self.runtime.container_image),
             container_mounts=self.runtime.container_mounts,
             env_to_set=env_to_set,
+            env_to_unset=env_to_unset,
             bash_preamble=bash_preamble,
             srun_options=self.runtime.srun_options,
             srun_export_env=CONTAINER_REMAP_ROOT_EXPORT if installs_dynamo(self.config) else None,
@@ -306,6 +316,8 @@ class WorkerStageMixin:
             "DYN_SYSTEM_PORT": str(leader.sys_port),
             "DYN_SKIP_SGLANG_LOG_FORMATTING": "1",
         }
+        if self.config.dynamo.event_plane:
+            env_to_set["DYN_EVENT_PLANE"] = self.config.dynamo.event_plane
 
         # Add OTEL env vars (before mode-specific env so OTEL_SERVICE_NAME can be overridden)
         env_to_set.update(build_otel_env(self.config.observability, mode))
@@ -398,12 +410,12 @@ class WorkerStageMixin:
 
         if launch_per_endpoint:
             # MPI-style: one srun per endpoint (TRTLLM)
-            for _endpoint_key, endpoint_processes in grouped.items():
+            for endpoint_processes in grouped.values():
                 managed = self.start_endpoint_worker(endpoint_processes)
                 result[managed.name] = managed
         else:
             # Per-process: one srun per node (SGLang)
-            for _endpoint_key, endpoint_processes in grouped.items():
+            for endpoint_processes in grouped.values():
                 for process in endpoint_processes:
                     managed = self.start_worker(process, endpoint_processes)
                     result[managed.name] = managed
