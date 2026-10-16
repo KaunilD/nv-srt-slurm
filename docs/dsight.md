@@ -57,7 +57,10 @@ Generation is CPU-only and requires no Slurm allocation, running deployment,
 GPU, container, or browser. It can also run on another machine with access to
 the same artifacts. Large captures can require substantial CPU, memory, and
 filesystem reads; follow your site's login-node resource limits and use a CPU
-job when needed.
+job when needed. Client JSONL imports use two streaming passes to find the time
+origin and normalize requests without retaining all decoded source records.
+Normalized requests and their joined evidence still consume memory proportional
+to the capture size; this is not a fixed-memory dashboard builder.
 
 Publish the complete report directory on a static HTTP host and open `index.html`.
 For local viewing, serve it with Python (no database service is needed):

@@ -12,6 +12,7 @@ import datetime as dt
 import json
 import math
 import re
+from collections.abc import Iterator
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -154,42 +155,53 @@ class Importer:
             raise ValueError(
                 f"Expected one client export (AIPerf or AgentPerf), found {len(files)}; select it with --client"
             )
-        rows = []
         native_adapter = None
         self.source(files[0], "client")
-        with files[0].open(encoding="utf-8") as stream:
-            for line, content in enumerate(stream, 1):
-                if not content.strip():
-                    continue
-                try:
-                    row = json.loads(content)
-                    if "metadata" not in row and "start_time" in row:
-                        if native_adapter is None:
-                            native_adapter = AgentPerfAdapter(files[0], self.source)
-                        row = native_adapter.normalize(row, line)
-                    metadata = row["metadata"]
-                    actual_phase = metadata.get("benchmark_phase")
-                    if self.phase != "all" and actual_phase not in (None, self.phase):
-                        self.audit["excluded_client_rows"] += 1
+
+        def read_rows(*, count_audit: bool) -> Iterator[tuple[int, dict[str, Any]]]:
+            nonlocal native_adapter
+            with files[0].open(encoding="utf-8") as stream:
+                for line, content in enumerate(stream, 1):
+                    if not content.strip():
                         continue
-                    if actual_phase is None:
-                        self.audit["clients_without_phase"] += 1
-                    for key in ("request_start_ns", "request_end_ns"):
-                        if int(metadata[key]) <= 0:
-                            raise ValueError(f"Invalid {key}")
-                    if int(metadata["request_end_ns"]) < int(metadata["request_start_ns"]):
-                        raise ValueError("Request ends before it starts")
-                    rows.append((line, row))
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise ValueError(f"{files[0]}:{line}: invalid client record: {exc}") from exc
-        if not rows:
+                    try:
+                        row = json.loads(content)
+                        if "metadata" not in row and "start_time" in row:
+                            if native_adapter is None:
+                                native_adapter = AgentPerfAdapter(files[0], self.source)
+                            row = native_adapter.normalize(row, line)
+                        metadata = row["metadata"]
+                        actual_phase = metadata.get("benchmark_phase")
+                        if self.phase != "all" and actual_phase not in (None, self.phase):
+                            if count_audit:
+                                self.audit["excluded_client_rows"] += 1
+                            continue
+                        if actual_phase is None and count_audit:
+                            self.audit["clients_without_phase"] += 1
+                        for key in ("request_start_ns", "request_end_ns"):
+                            if int(metadata[key]) <= 0:
+                                raise ValueError(f"Invalid {key}")
+                        if int(metadata["request_end_ns"]) < int(metadata["request_start_ns"]):
+                            raise ValueError("Request ends before it starts")
+                        yield line, row
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ValueError(f"{files[0]}:{line}: invalid client record: {exc}") from exc
+
+        # Discover the measurement origin without retaining decoded exports.
+        # Re-read to normalize one request at a time: raw metrics and payloads
+        # can be much larger than the request fields kept by the dashboard.
+        origin = min(
+            (int(row["metadata"]["request_start_ns"]) for _, row in read_rows(count_audit=True)),
+            default=None,
+        )
+        if origin is None:
             if self.audit["excluded_client_rows"]:
                 raise ValueError(f"No requests for phase {self.phase!r}; warmup is never substituted")
             self.source_window()
             return
-        self.origin = min(int(r["metadata"]["request_start_ns"]) for _, r in rows)
+        self.origin = origin
         self.requests: list[dict[str, Any]] = []
-        for line, row in rows:
+        for line, row in read_rows(count_audit=False):
             m = row["metadata"]
             start, end = self.t(m["request_start_ns"]), self.t(m["request_end_ns"])
             ttft = metric_value(row, "time_to_first_token")
@@ -256,7 +268,7 @@ class Importer:
         self.duration = max(r["end"] for r in self.requests)
         if self.duration <= 0:
             raise ValueError("Client export has no positive elapsed time")
-        self.audit.update(client_requests=len(rows))
+        self.audit.update(client_requests=len(self.requests))
         if self.audit["clients_without_phase"]:
             self.warnings.append(
                 "Some client records have no benchmark_phase; included as unclassified, not certified measured-only."
